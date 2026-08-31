@@ -160,6 +160,14 @@ func ErrorCodeToLinkError(code string) *Error {
 	case "503", "read_pxy_timeout":
 		return NewRetryableError(Err503, code)
 	default:
+		// code falls back to the raw HTTP status when the provider sends no
+		// X-Error header (see Service.validateLink) — a gateway/CDN error
+		// (502, 504, Cloudflare's 520-529, etc.) is transient, not a dead
+		// link. Only classify it Permanent when it isn't a plain numeric
+		// status at all, i.e. an actually-unrecognized provider error code.
+		if status, err := strconv.Atoi(code); err == nil && status >= 500 {
+			return NewRetryableError(fmt.Errorf("HTTP %d", status), code)
+		}
 		return NewPermanentError(fmt.Errorf("unknown error code: %s", code), code)
 	}
 }
