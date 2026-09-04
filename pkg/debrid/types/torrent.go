@@ -176,6 +176,13 @@ func (dl *DownloadLink) Empty() bool {
 	return dl.DownloadLink == ""
 }
 
+// Expired reports whether the provider has already invalidated this link.
+// A zero ExpiresAt means the provider never told us when the link dies, so it
+// is treated as still live and only a failed request can retire it.
+func (dl *DownloadLink) Expired() bool {
+	return !dl.ExpiresAt.IsZero() && time.Now().After(dl.ExpiresAt)
+}
+
 func (dl *DownloadLink) String() string {
 	return dl.DownloadLink
 }

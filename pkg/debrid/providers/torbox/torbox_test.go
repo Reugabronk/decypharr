@@ -9,10 +9,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/request"
+	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/debrid/account"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
@@ -113,6 +115,12 @@ func TestFetchDownloadLinkResolvesCDNURL(t *testing.T) {
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("requestdl calls = %d, want 1", got)
 	}
+	// TorBox retires the signed CDN URL long before auto_expire_links_after, so
+	// the cached link has to carry the shorter deadline or playback breaks on a
+	// URL the account cache still considers good.
+	if until := time.Until(dl.ExpiresAt); until <= 0 || until > cdnLinkTTL {
+		t.Fatalf("ExpiresAt in %v, want a positive TTL of at most %v", until, cdnLinkTTL)
+	}
 }
 
 // TestFetchDownloadLinkFallsBackToRedirectURL keeps a transient API failure
@@ -138,9 +146,36 @@ func TestFetchDownloadLinkFallsBackToRedirectURL(t *testing.T) {
 
 func testTorbox(host string) *Torbox {
 	return &Torbox{
-		Host:   host,
-		client: request.New(request.WithMaxRetries(0)),
-		logger: zerolog.Nop(),
-		config: config.Debrid{Name: "torbox"},
+		Host:                  host,
+		client:                request.New(request.WithMaxRetries(0)),
+		logger:                zerolog.Nop(),
+		config:                config.Debrid{Name: "torbox"},
+		autoExpiresLinksAfter: 48 * time.Hour,
+	}
+}
+
+// TestSubmitMagnetSurfacesAPIError keeps the opaque "Status: 400" out of the
+// Arr logs: the usual cause is an uncached release rejected because
+// add_only_if_cached is set, and TorBox says so in the response body.
+func TestSubmitMagnetSurfacesAPIError(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"success":false,"error":"DOWNLOAD_SERVER_ERROR","detail":"Torrent is not cached."}`)
+	}))
+	t.Cleanup(server.Close)
+
+	tb := testTorbox(server.URL)
+	_, err := tb.SubmitMagnet(&types.Torrent{Magnet: &utils.Magnet{Link: "magnet:?xt=urn:btih:abc"}})
+	if err == nil {
+		t.Fatal("SubmitMagnet() error = nil, want the API error")
+	}
+	got := err.Error()
+	for _, want := range []string{"400", "DOWNLOAD_SERVER_ERROR", "Torrent is not cached."} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("SubmitMagnet() error = %q, want it to mention %q", got, want)
+		}
 	}
 }

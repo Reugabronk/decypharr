@@ -30,6 +30,13 @@ import (
 	"go.uber.org/ratelimit"
 )
 
+// cdnLinkTTL bounds how long a resolved CDN URL stays in the account link
+// cache. TorBox signs those URLs and retires them after a few hours, well
+// inside the 48h default of auto_expire_links_after, so the cache has to use
+// the shorter of the two or it will serve dead URLs. One refetch per file per
+// hour is nothing against the 300 req/min API budget.
+const cdnLinkTTL = time.Hour
+
 var planSlots = map[string]int{
 	"essential": 3,
 	"standard":  5,
@@ -132,9 +139,14 @@ func (tb *Torbox) doGet(endpoint string, queryParams map[string]string, result a
 	}
 	defer request.DrainAndClose(resp.Body)
 
-	if result != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.ContentLength != 0 {
+	if result != nil && resp.ContentLength != 0 {
 		if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(result); err != nil {
-			return resp, err
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return resp, err
+			}
+			// A failure response that isn't JSON (a proxy's HTML error page,
+			// say) carries no provider message to surface; leave result empty
+			// and let the caller report the status on its own.
 		}
 	}
 
@@ -160,9 +172,14 @@ func (tb *Torbox) doPostForm(endpoint string, formData map[string]string, result
 	}
 	defer request.DrainAndClose(resp.Body)
 
-	if result != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.ContentLength != 0 {
+	if result != nil && resp.ContentLength != 0 {
 		if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(result); err != nil {
-			return resp, err
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return resp, err
+			}
+			// A failure response that isn't JSON (a proxy's HTML error page,
+			// say) carries no provider message to surface; leave result empty
+			// and let the caller report the status on its own.
 		}
 	}
 
@@ -232,6 +249,25 @@ func (tb *Torbox) IsAvailable(hashes []string) map[string]bool {
 	return result
 }
 
+// apiErrorDetail renders TorBox's own error fields as a parenthesised suffix,
+// or an empty string when the API said nothing useful. Error is typed any
+// because TorBox sends either a string code or false.
+func apiErrorDetail(apiErr any, detail string) string {
+	parts := make([]string, 0, 2)
+	if apiErr != nil {
+		if s := strings.TrimSpace(fmt.Sprintf("%v", apiErr)); s != "" && s != "false" && s != "<nil>" {
+			parts = append(parts, s)
+		}
+	}
+	if d := strings.TrimSpace(detail); d != "" {
+		parts = append(parts, d)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ": ") + ")"
+}
+
 func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	var data AddMagnetResponse
 
@@ -248,7 +284,10 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("torbox API error: Status: %d", resp.StatusCode)
+		// Surface TorBox's own explanation: the common failure here is a 400
+		// for an uncached release when add_only_if_cached is set, and a bare
+		// status code sends the user hunting through decypharr instead.
+		return nil, fmt.Errorf("torbox API error: Status: %d%s", resp.StatusCode, apiErrorDetail(data.Error, data.Detail))
 	}
 	if data.Data == nil {
 		return nil, fmt.Errorf("error adding torrent")
@@ -519,6 +558,7 @@ func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *t
 	if err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 &&
 		res.Data != nil && *res.Data != "" {
 		dl.DownloadLink = *res.Data
+		dl.ExpiresAt = now.Add(min(tb.autoExpiresLinksAfter, cdnLinkTTL))
 		return dl, nil
 	}
 
