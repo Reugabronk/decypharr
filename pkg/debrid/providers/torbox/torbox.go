@@ -487,28 +487,62 @@ func (tb *Torbox) GetDownloadLink(id string, file *types.File) (types.DownloadLi
 }
 
 func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
-	query := url.Values{}
-	query.Set("token", account.Token)
-	query.Set("torrent_id", id)
-	query.Set("file_id", file.Id)
-	query.Set("redirect", "true")
-
-	downloadURL := fmt.Sprintf("%s/api/torrents/requestdl?%s", tb.Host, query.Encode())
+	params := map[string]string{
+		"token":      account.Token,
+		"torrent_id": id,
+		"file_id":    file.Id,
+	}
 
 	now := time.Now()
 
 	// Always expires
 	dl := types.DownloadLink{
-		Filename:     file.Name,
-		Size:         file.Size,
-		Token:        tb.APIKey,
-		Link:         file.Link,
-		DownloadLink: downloadURL,
-		Debrid:       tb.config.Name,
-		Id:           file.Id,
-		Generated:    now,
-		ExpiresAt:    now.Add(tb.autoExpiresLinksAfter),
+		Filename:  file.Name,
+		Size:      file.Size,
+		Token:     tb.APIKey,
+		Link:      file.Link,
+		Debrid:    tb.config.Name,
+		Id:        file.Id,
+		Generated: now,
+		ExpiresAt: now.Add(tb.autoExpiresLinksAfter),
 	}
+
+	// Resolve the CDN URL here, once, rather than handing the caller TorBox's
+	// requestdl endpoint. That endpoint counts against the 300 req/min API cap,
+	// and the streaming layer issues a request per range read (plus one per
+	// link validation), so a redirect URL spends the whole minute's budget on a
+	// single file's playback and returns 429s for everything else. The resolved
+	// CDN URL is cached by the account link cache, so this costs one API call
+	// per file instead of one per chunk.
+	var res RequestDLResponse
+	resp, err := tb.doGet("/api/torrents/requestdl", params, &res)
+	if err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 &&
+		res.Data != nil && *res.Data != "" {
+		dl.DownloadLink = *res.Data
+		return dl, nil
+	}
+
+	// The API gave us no usable URL (transient failure, or a response shape we
+	// don't recognise). Fall back to the redirecting endpoint: rate-limited
+	// playback still beats no playback, and this is what every link looked like
+	// before the resolution step existed.
+	query := url.Values{}
+	for k, v := range params {
+		query.Set(k, v)
+	}
+	query.Set("redirect", "true")
+	dl.DownloadLink = fmt.Sprintf("%s/api/torrents/requestdl?%s", tb.Host, query.Encode())
+
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	tb.logger.Debug().
+		Err(err).
+		Int("status", status).
+		Str("file", file.Name).
+		Msg("requestdl returned no direct link, falling back to the redirect URL")
+
 	return dl, nil
 }
 
