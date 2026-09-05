@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"go.uber.org/ratelimit"
+	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
 
@@ -272,6 +273,17 @@ func New(options ...ClientOption) *Client {
 
 		// Configure proxy if needed
 		SetProxy(transport, client.proxy)
+
+		// Teach the HTTP/2 transport to notice dead connections. Without a
+		// health check it keeps a silently-broken connection in the pool — a
+		// routine outcome behind CDNs and NAT — and every request handed that
+		// connection fails instantly with "timeout awaiting response headers",
+		// retries included, since the retries reuse the same dead connection.
+		// With a ping the transport evicts it and dials a fresh one.
+		if h2, err := http2.ConfigureTransports(transport); err == nil && h2 != nil {
+			h2.ReadIdleTimeout = 30 * time.Second
+			h2.PingTimeout = 10 * time.Second
+		}
 
 		// Set the transport to the client
 		client.httpClient.Transport = transport

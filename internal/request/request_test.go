@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"golang.org/x/net/http2"
 )
 
 // TestWithResponseHeaderTimeout guards the slow-endpoint case: adding an
@@ -51,5 +52,20 @@ func TestTimeoutClearsResponseHeaderTimeout(t *testing.T) {
 	if c.httpClient.Timeout <= tr.ResponseHeaderTimeout {
 		t.Fatalf("client timeout %v does not clear response header timeout %v",
 			c.httpClient.Timeout, tr.ResponseHeaderTimeout)
+	}
+}
+
+// TestHTTP2HealthCheckConfigured guards against the failure that motivated it:
+// a silently dead HTTP/2 connection stays in the pool, and every request
+// handed that connection — retries included — fails instantly with "timeout
+// awaiting response headers" without ever reaching the network.
+func TestHTTP2HealthCheckConfigured(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	c := New()
+	tr := c.httpClient.Transport.(*http.Transport)
+	h2, err := http2.ConfigureTransports(tr)
+	if err == nil && h2 != nil {
+		t.Fatal("ConfigureTransports succeeded again, so New() never configured HTTP/2 itself")
 	}
 }
