@@ -78,3 +78,24 @@ func hexPrefix(b []byte) string {
 	return buf.String()
 }
 
+
+func TestDescribeHead(t *testing.T) {
+	tests := []struct {
+		name string
+		head []byte
+		want string
+	}{
+		{"rar", []byte("Rar!\x1a\x07\x00rest"), "a RAR archive (compressed or encrypted archives can't be streamed)"},
+		{"par2", []byte("PAR2\x00PKT more"), "a PAR2 recovery block, not the media file"},
+		{"html", []byte("<!DOCTYPE html><body>"), "an HTML page (the server returned an error document, not an article)"},
+		{"empty", nil, "no data"},
+		{"unknown", []byte{0xde, 0xad, 0xbe, 0xef, 'a', 'b', 'c', 'd', 'e'}, "deadbeef61626364 \"....abcd\""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := describeHead(tt.head); got != tt.want {
+				t.Fatalf("describeHead() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
