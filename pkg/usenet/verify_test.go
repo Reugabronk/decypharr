@@ -2,7 +2,13 @@ package usenet
 
 import (
 	"bytes"
+	"errors"
 	"testing"
+	"time"
+
+	"github.com/puzpuzpuz/xsync/v4"
+	"github.com/rs/zerolog"
+	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 // pad extends a head to the read size the verifier sees, filling with a
@@ -78,7 +84,6 @@ func hexPrefix(b []byte) string {
 	return buf.String()
 }
 
-
 func TestDescribeHead(t *testing.T) {
 	tests := []struct {
 		name string
@@ -97,5 +102,36 @@ func TestDescribeHead(t *testing.T) {
 				t.Fatalf("describeHead() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestPreStreamChecksExpiresFailureMemo covers the case that made a file
+// unreadable until decypharr restarted: one missing-article read marked the
+// file failed, and the mark never aged out — so even the parts that read fine
+// returned an I/O error forever.
+func TestPreStreamChecksExpiresFailureMemo(t *testing.T) {
+	u := &Usenet{
+		logger:      zerolog.Nop(),
+		failedFiles: xsync.NewMap[string, failedFile](),
+	}
+	file := &storage.NZBFile{
+		NzbID:    "nzb-1",
+		Name:     "Release.mkv",
+		Segments: []storage.NZBSegment{{MessageID: "<a@b>"}},
+	}
+	key := fsKey(file.NzbID, file.Name)
+	cause := errors.New("article not found")
+
+	u.failedFiles.Store(key, failedFile{cause: cause, at: time.Now()})
+	if err := u.preStreamChecks(file); err == nil {
+		t.Fatal("preStreamChecks() = nil for a freshly marked file, want the memoized failure")
+	}
+
+	u.failedFiles.Store(key, failedFile{cause: cause, at: time.Now().Add(-failedFileTTL - time.Minute)})
+	if err := u.preStreamChecks(file); err != nil {
+		t.Fatalf("preStreamChecks() = %v after the memo expired, want nil so the read is retried", err)
+	}
+	if _, ok := u.failedFiles.Load(key); ok {
+		t.Fatal("expired memo still present, want it dropped so a fresh failure re-marks it")
 	}
 }
