@@ -228,3 +228,21 @@ func TestGetTorboxStatusStalled(t *testing.T) {
 		})
 	}
 }
+
+// TestRedactToken keeps the account token out of the log: transport errors
+// quote the full request URL, and TorBox takes the token as a query parameter.
+func TestRedactToken(t *testing.T) {
+	err := fmt.Errorf(`GET https://api.torbox.app/v1/api/torrents/requestdl?file_id=2&token=3faacb32-94ba-4290-a394-1a2de1303b26&torrent_id=90939621 giving up after 4 attempt(s)`)
+	got := redactToken(err)
+	if strings.Contains(got, "3faacb32") {
+		t.Fatalf("redactToken() = %q, still contains the token", got)
+	}
+	for _, want := range []string{"token=REDACTED", "torrent_id=90939621", "giving up after 4"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("redactToken() = %q, want it to keep %q", got, want)
+		}
+	}
+	if redactToken(nil) != "" {
+		t.Fatalf("redactToken(nil) = %q, want empty", redactToken(nil))
+	}
+}

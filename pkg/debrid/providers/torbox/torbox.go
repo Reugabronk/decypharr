@@ -524,6 +524,20 @@ func (tb *Torbox) CheckStatus(torrent *types.Torrent) (*types.Torrent, error) {
 	}
 }
 
+// tokenQueryParam matches the account token TorBox takes as a query parameter.
+// Transport errors quote the whole URL, so logging one verbatim writes the
+// user's API key into a file they are likely to share when asking for help.
+var tokenQueryParam = regexp.MustCompile(`(?i)(token=)[^&\s"]+`)
+
+// redactToken renders an error for the log with any token query parameter
+// masked. A nil error becomes the empty string.
+func redactToken(err error) string {
+	if err == nil {
+		return ""
+	}
+	return tokenQueryParam.ReplaceAllString(err.Error(), "${1}REDACTED")
+}
+
 // torboxStateOrUnknown keeps the error readable when the provider sent no
 // state at all.
 func torboxStateOrUnknown(state string) string {
@@ -606,7 +620,7 @@ func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *t
 		status = resp.StatusCode
 	}
 	tb.logger.Debug().
-		Err(err).
+		Str("error", redactToken(err)).
 		Int("status", status).
 		Str("file", file.Name).
 		Msg("requestdl returned no direct link, falling back to the redirect URL")
