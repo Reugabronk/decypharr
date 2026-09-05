@@ -39,3 +39,17 @@ func TestDefaultResponseHeaderTimeout(t *testing.T) {
 		t.Fatalf("ResponseHeaderTimeout = %v, want the 30s default", tr.ResponseHeaderTimeout)
 	}
 }
+
+// TestTimeoutClearsResponseHeaderTimeout catches the mistake of raising the
+// header timeout alone: the client's overall deadline cuts the request off
+// first, so the longer header timeout never takes effect.
+func TestTimeoutClearsResponseHeaderTimeout(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	c := New(WithResponseHeaderTimeout(2*time.Minute), WithTimeout(3*time.Minute))
+	tr := c.httpClient.Transport.(*http.Transport)
+	if c.httpClient.Timeout <= tr.ResponseHeaderTimeout {
+		t.Fatalf("client timeout %v does not clear response header timeout %v",
+			c.httpClient.Timeout, tr.ResponseHeaderTimeout)
+	}
+}

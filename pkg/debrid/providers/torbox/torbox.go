@@ -88,6 +88,10 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		// reports a failure for a submission that often succeeds anyway, and
 		// each retry files the same torrent again.
 		request.WithResponseHeaderTimeout(2 * time.Minute),
+		// The client's overall deadline has to clear that header timeout, or it
+		// cuts the request off first and the longer header timeout never
+		// applies.
+		request.WithTimeout(3 * time.Minute),
 	}
 	if dc.Proxy != "" {
 		opts = append(opts, request.WithProxy(dc.Proxy))
