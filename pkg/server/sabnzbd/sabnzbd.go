@@ -80,37 +80,37 @@ func (s *SABnzbd) SetConfig(cfg *config.Config) {
 
 func (s *SABnzbd) getCategories() []Category {
 	arrs := s.manager.Arr().GetAll()
-	categories := make([]Category, 0, len(arrs))
+	names := make([]string, 0, len(arrs))
+	for _, a := range arrs {
+		names = append(names, a.Name)
+	}
+	return buildCategories(names, s.defaultCategories, s.downloadFolder)
+}
+
+// buildCategories renders the category list the Arrs see in their SABnzbd
+// client: one per known Arr, plus the configured defaults. Names are
+// deduplicated across both sources — an Arr named after a configured category
+// would otherwise appear twice in the Arr's dropdown.
+func buildCategories(arrNames, defaults []string, downloadFolder string) []Category {
+	categories := make([]Category, 0, len(arrNames)+len(defaults))
 	added := map[string]struct{}{}
 
-	for i, a := range arrs {
-		if _, ok := added[a.Name]; ok {
-			continue // Skip if category already added
+	for _, name := range append(append([]string{}, arrNames...), defaults...) {
+		if name == "" {
+			continue
+		}
+		if _, ok := added[name]; ok {
+			continue
 		}
 		categories = append(categories, Category{
-			Name:     a.Name,
-			Order:    i + 1,
-			Pp:       "3",
-			Script:   "None",
-			Dir:      filepath.Join(s.downloadFolder, a.Name),
-			Priority: PriorityNormal,
-		})
-	}
-
-	// Add default categories if not already present
-	for _, defaultCat := range s.defaultCategories {
-		if _, ok := added[defaultCat]; ok {
-			continue // Skip if default category already added
-		}
-		categories = append(categories, Category{
-			Name:     defaultCat,
+			Name:     name,
 			Order:    len(categories) + 1,
 			Pp:       "3",
 			Script:   "None",
-			Dir:      filepath.Join(s.downloadFolder, defaultCat),
+			Dir:      filepath.Join(downloadFolder, name),
 			Priority: PriorityNormal,
 		})
-		added[defaultCat] = struct{}{}
+		added[name] = struct{}{}
 	}
 
 	return categories

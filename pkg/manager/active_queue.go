@@ -20,6 +20,19 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		return entries[i].AddedOn.Before(entries[j].AddedOn)
 	})
 
+	// IsDownloading marks "a goroutine is working on this right now". It is
+	// persisted with the entry, so a restart mid-download leaves it set with no
+	// goroutine behind it — and processQueuedEntries skips any entry carrying
+	// it. That entry then sits at 100% in the Arr, in the downloading state,
+	// forever: never completed, never imported, only removable by hand.
+	// Restoring is exactly the moment no download is in flight, so clear it.
+	for _, entry := range entries {
+		if entry.IsDownloading {
+			entry.IsDownloading = false
+			_ = m.queue.Update(entry)
+		}
+	}
+
 	// Existing active downloads reserve slots before queued imports are resumed.
 	for _, entry := range entries {
 		if entry.Status == debridTypes.TorrentStatusQueued || m.nzbNeedsReprocessing(entry) {

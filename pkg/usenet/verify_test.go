@@ -2,7 +2,13 @@ package usenet
 
 import (
 	"bytes"
+	"errors"
 	"testing"
+	"time"
+
+	"github.com/puzpuzpuz/xsync/v4"
+	"github.com/rs/zerolog"
+	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 // pad extends a head to the read size the verifier sees, filling with a
@@ -78,3 +84,78 @@ func hexPrefix(b []byte) string {
 	return buf.String()
 }
 
+func TestDescribeHead(t *testing.T) {
+	tests := []struct {
+		name string
+		head []byte
+		want string
+	}{
+		{"rar", []byte("Rar!\x1a\x07\x00rest"), "a RAR archive (compressed or encrypted archives can't be streamed)"},
+		{"par2", []byte("PAR2\x00PKT more"), "a PAR2 recovery block, not the media file"},
+		{"html", []byte("<!DOCTYPE html><body>"), "an HTML page (the server returned an error document, not an article)"},
+		{"empty", nil, "no data"},
+		{"unknown", []byte{0xde, 0xad, 0xbe, 0xef, 'a', 'b', 'c', 'd', 'e'}, "deadbeef61626364 \"....abcd\""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := describeHead(tt.head); got != tt.want {
+				t.Fatalf("describeHead() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPreStreamChecksExpiresFailureMemo covers the case that made a file
+// unreadable until decypharr restarted: one missing-article read marked the
+// file failed, and the mark never aged out — so even the parts that read fine
+// returned an I/O error forever.
+func TestPreStreamChecksExpiresFailureMemo(t *testing.T) {
+	u := &Usenet{
+		logger:      zerolog.Nop(),
+		failedFiles: xsync.NewMap[string, failedFile](),
+	}
+	file := &storage.NZBFile{
+		NzbID:    "nzb-1",
+		Name:     "Release.mkv",
+		Segments: []storage.NZBSegment{{MessageID: "<a@b>"}},
+	}
+	key := fsKey(file.NzbID, file.Name)
+	cause := errors.New("article not found")
+
+	u.failedFiles.Store(key, failedFile{cause: cause, at: time.Now()})
+	if err := u.preStreamChecks(file); err == nil {
+		t.Fatal("preStreamChecks() = nil for a freshly marked file, want the memoized failure")
+	}
+
+	u.failedFiles.Store(key, failedFile{cause: cause, at: time.Now().Add(-failedFileTTL - time.Minute)})
+	if err := u.preStreamChecks(file); err != nil {
+		t.Fatalf("preStreamChecks() = %v after the memo expired, want nil so the read is retried", err)
+	}
+	if _, ok := u.failedFiles.Load(key); ok {
+		t.Fatal("expired memo still present, want it dropped so a fresh failure re-marks it")
+	}
+}
+
+// TestAvailabilityInconclusive keeps a throttled provider from costing the
+// user a good release: a sweep whose probes mostly failed to complete says
+// nothing about whether the post is complete.
+func TestAvailabilityInconclusive(t *testing.T) {
+	tests := []struct {
+		name  string
+		total int
+		errs  int
+		want  bool
+	}{
+		{"the sweep that started this", 420, 342, true},
+		{"exactly half errored is still a verdict", 420, 210, false},
+		{"clean sweep", 420, 0, false},
+		{"nothing sampled", 0, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := availabilityInconclusive(tt.total, tt.errs); got != tt.want {
+				t.Fatalf("availabilityInconclusive(%d, %d) = %v, want %v", tt.total, tt.errs, got, tt.want)
+			}
+		})
+	}
+}

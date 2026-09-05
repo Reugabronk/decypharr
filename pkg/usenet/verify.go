@@ -34,8 +34,8 @@ func headSignatureOK(head []byte) bool {
 		bytes.HasPrefix(head, []byte("OggS")), // ogv/ogm/ogg/opus
 		bytes.HasPrefix(head, []byte("FLV\x01")),
 		bytes.HasPrefix(head, []byte{0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11}), // ASF: wmv/wma
-		bytes.HasPrefix(head, []byte{0x00, 0x00, 0x01, 0xBA}), // MPEG-PS: mpg/vob
-		bytes.HasPrefix(head, []byte("ID3")),                  // MP3 with ID3v2 tag
+		bytes.HasPrefix(head, []byte{0x00, 0x00, 0x01, 0xBA}),                         // MPEG-PS: mpg/vob
+		bytes.HasPrefix(head, []byte("ID3")),                                          // MP3 with ID3v2 tag
 		bytes.HasPrefix(head, []byte("fLaC")),
 		bytes.HasPrefix(head, []byte("FORM")),     // AIFF
 		bytes.HasPrefix(head, []byte("MAC ")),     // Monkey's Audio
@@ -103,7 +103,58 @@ func (u *Usenet) VerifyFileHead(ctx context.Context, file *storage.NZBFile) erro
 	if headSignatureOK(head[:n]) {
 		return nil
 	}
-	return fmt.Errorf("head of %q matches no media container signature: %w", file.Name, customerror.UsenetCorruptContentError)
+	return fmt.Errorf("head of %q matches no media container signature (starts with %s): %w",
+		file.Name, describeHead(head[:n]), customerror.UsenetCorruptContentError)
+}
+
+// describeHead renders the first bytes of a rejected head so the log says what
+// arrived instead of a playable file. "corrupt" covers several very different
+// situations — a RAR the streamer can't unpack, a par2 block, an obfuscated
+// post, an error page served as an article — and telling them apart from the
+// log line saves a round of guessing.
+func describeHead(head []byte) string {
+	if len(head) == 0 {
+		return "no data"
+	}
+	if name, ok := knownNonMediaHead(head); ok {
+		return name
+	}
+	n := min(len(head), 8)
+	return fmt.Sprintf("%x %q", head[:n], printableASCII(head[:n]))
+}
+
+// knownNonMediaHead names the non-media formats that show up here often enough
+// to be worth naming outright.
+func knownNonMediaHead(head []byte) (string, bool) {
+	switch {
+	case bytes.HasPrefix(head, []byte("Rar!\x1a\x07")):
+		return "a RAR archive (compressed or encrypted archives can't be streamed)", true
+	case bytes.HasPrefix(head, []byte("PAR2\x00")):
+		return "a PAR2 recovery block, not the media file", true
+	case bytes.HasPrefix(head, []byte("PK\x03\x04")):
+		return "a ZIP archive", true
+	case bytes.HasPrefix(head, []byte("7z\xbc\xaf\x27\x1c")):
+		return "a 7-Zip archive", true
+	case bytes.HasPrefix(head, []byte{0xFD, '7', 'z', 'X', 'Z'}):
+		return "an XZ archive", true
+	case bytes.HasPrefix(head, []byte("<!DOCTYPE")), bytes.HasPrefix(head, []byte("<html")):
+		return "an HTML page (the server returned an error document, not an article)", true
+	}
+	return "", false
+}
+
+// printableASCII renders b with non-printable bytes as dots, so the log stays
+// readable whatever arrived.
+func printableASCII(b []byte) string {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if c >= 0x20 && c < 0x7f {
+			out[i] = c
+			continue
+		}
+		out[i] = '.'
+	}
+	return string(out)
 }
 
 // VerifyFile head-verifies one stored file of a completed NZB. Non-media

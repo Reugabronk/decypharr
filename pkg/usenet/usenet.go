@@ -237,9 +237,22 @@ type Usenet struct {
 	maxConnections           int         // Connections allocated per streaming file
 	processingMaxConnections int         // Connections allocated per file for parsing and NZB downloads
 	prefetchSize             int64       // Streaming prefetch size in bytes
-	failedFiles              *xsync.Map[string, error]
+	failedFiles              *xsync.Map[string, failedFile]
 
 	fs *xsync.Map[string, *fsEntry]
+}
+
+// failedFileTTL bounds how long a file stays marked unreadable after a read
+// hit a missing article. Long enough that a genuinely incomplete post isn't
+// retried on every seek, short enough that a provider hiccup heals itself
+// without restarting decypharr.
+const failedFileTTL = 30 * time.Minute
+
+// failedFile records why a file was marked unreadable and when, so the mark
+// can expire.
+type failedFile struct {
+	cause error
+	at    time.Time
 }
 
 // fsKey builds a cache key for fs map entries efficiently.
@@ -312,7 +325,7 @@ func New() (*Usenet, error) {
 		processingMaxConnections: processingMaxConns,
 		prefetchSize:             prefetchSize,
 		fs:                       xsync.NewMap[string, *fsEntry](),
-		failedFiles:              xsync.NewMap[string, error](),
+		failedFiles:              xsync.NewMap[string, failedFile](),
 	}
 
 	// clean streams dir
@@ -654,6 +667,22 @@ func (u *Usenet) checkAvailability(ctx context.Context, fileName string, message
 			// All failures were connection errors, not missing articles.
 			return nil
 		}
+		// A sweep that mostly failed to complete is not evidence about the
+		// post. Providers throttle long STAT bursts by dropping connections,
+		// and the not-found answers that come back while the server is
+		// shedding load are not trustworthy either — condemning the release on
+		// them costs the user a good grab. Treat a mostly-errored sweep the
+		// same as the transport error above: couldn't check.
+		if availabilityInconclusive(result.TotalCount, result.ErrorCount) {
+			u.logger.Warn().
+				Str("file", fileName).
+				Int("sampled_segments", len(messageIDs)).
+				Int("available_segments", result.FoundCount).
+				Int("missing_segments", notFoundCount).
+				Int("error_count", result.ErrorCount).
+				Msg("Availability check inconclusive: most probes failed to complete, not failing the NZB")
+			return nil
+		}
 		// At least some segments are definitively missing.
 		u.logger.Warn().
 			Str("file", fileName).
@@ -666,6 +695,14 @@ func (u *Usenet) checkAvailability(ctx context.Context, fileName string, message
 	}
 
 	return nil
+}
+
+// availabilityInconclusive reports whether too much of a STAT sweep failed to
+// complete for its verdict to mean anything. Providers throttle long STAT
+// bursts by dropping connections, and the not-found answers returned while a
+// server sheds load are no more trustworthy than the dropped ones.
+func availabilityInconclusive(total, errCount int) bool {
+	return total > 0 && errCount*2 > total
 }
 
 // sampleSegments returns a sample of segment message IDs based on the given
@@ -760,11 +797,41 @@ func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
 	}
 
 	// Check if file was marked as failed previously
-	if cause, ok := u.failedFiles.Load(fsKey(file.NzbID, file.Name)); ok {
-		return customerror.NewSilentError(cause).Permanent()
+	key := fsKey(file.NzbID, file.Name)
+	if failed, ok := u.failedFiles.Load(key); ok {
+		if time.Since(failed.at) < failedFileTTL {
+			return customerror.NewSilentError(failed.cause).Permanent()
+		}
+		// The memo has aged out. A provider that answered "no such article"
+		// once may simply have been hiccupping — with a single provider
+		// configured there is no second server to mask that — and without an
+		// expiry the file stays unreadable until decypharr restarts, head
+		// included. Retrying costs one failed read if the article really is
+		// gone, and the mark goes straight back on.
+		u.failedFiles.Delete(key)
+		u.logger.Debug().
+			Str("file", file.Name).
+			Dur("marked_for", time.Since(failed.at)).
+			Msg("Retrying a file that was marked failed; its failure memo expired")
 	}
 
 	return nil
+}
+
+// markFileFailed remembers a file whose read hit a missing article, so later
+// reads fail fast instead of walking into the same hole. The mark expires
+// (see failedFileTTL) and is logged, because the read path returns a silent
+// error for it: without this line a file that stops playing leaves nothing
+// in the log to explain why.
+func (u *Usenet) markFileFailed(key string, cause error) {
+	if _, existing := u.failedFiles.Load(key); !existing {
+		u.logger.Warn().
+			Err(cause).
+			Str("file", key).
+			Dur("retry_after", failedFileTTL).
+			Msg("Marking file as failed; further reads are refused until the mark expires")
+	}
+	u.failedFiles.Store(key, failedFile{cause: cause, at: time.Now()})
 }
 
 // FileHandle is a pull-based handle over one usenet file, backed by the
@@ -817,7 +884,7 @@ func (h *FileHandle) ReadAtContext(ctx context.Context, p []byte, off int64) (in
 		return n, ctx.Err()
 	}
 	if err != nil && nntp.IsArticleNotFoundError(err) {
-		h.u.failedFiles.Store(h.key, err)
+		h.u.markFileFailed(h.key, err)
 		return n, customerror.NewArticleNotFoundError(err)
 	}
 	return n, err
@@ -919,7 +986,7 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 
 	// Mark file as failed if article not found (permanent error)
 	if err != nil && nntp.IsArticleNotFoundError(err) {
-		u.failedFiles.Store(key, err) // Reuse pre-computed key
+		u.markFileFailed(key, err) // Reuse pre-computed key
 		// Wrap error to mark as permanent
 		return customerror.NewArticleNotFoundError(err)
 	}
