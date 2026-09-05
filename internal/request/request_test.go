@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/sirrobot01/decypharr/internal/config"
 )
 
 // TestWithResponseHeaderTimeout guards the slow-endpoint case: adding an
@@ -11,6 +13,8 @@ import (
 // the 30s transport default turns that into a failure plus retried duplicate
 // submissions.
 func TestWithResponseHeaderTimeout(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
 	c := New(WithResponseHeaderTimeout(2 * time.Minute))
 	tr, ok := c.httpClient.Transport.(*http.Transport)
 	if !ok {
@@ -24,6 +28,8 @@ func TestWithResponseHeaderTimeout(t *testing.T) {
 // TestDefaultResponseHeaderTimeout keeps the option from changing clients that
 // don't ask for it.
 func TestDefaultResponseHeaderTimeout(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
 	c := New()
 	tr, ok := c.httpClient.Transport.(*http.Transport)
 	if !ok {
