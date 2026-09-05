@@ -83,6 +83,11 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		request.WithMaxRetries(cfg.Retries),
 		request.WithRetryableStatus(http.StatusTooManyRequests, http.StatusBadGateway),
 		request.WithLogger(_log),
+		// Adding an uncached torrent makes TorBox go find the swarm before it
+		// answers, which regularly outlasts the 30s default. Giving up there
+		// reports a failure for a submission that often succeeds anyway, and
+		// each retry files the same torrent again.
+		request.WithResponseHeaderTimeout(2 * time.Minute),
 	}
 	if dc.Proxy != "" {
 		opts = append(opts, request.WithProxy(dc.Proxy))
