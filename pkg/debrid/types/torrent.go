@@ -21,12 +21,17 @@ type Torrent struct {
 	Magnet           *utils.Magnet   `json:"magnet"`
 	Files            map[string]File `json:"files"`
 	Status           TorrentStatus   `json:"status"`
-	Added            time.Time       `json:"added"`
-	Progress         float64         `json:"progress"`
-	Speed            int64           `json:"speed"`
-	Seeders          int             `json:"seeders"`
-	Links            []string        `json:"links"`
-	DeletedFiles     []string        `json:"deleted_files"`
+	// DebridStatus is the provider's own state string behind Status. Status
+	// collapses every failure into one value, which makes an error message
+	// built from it useless for telling "no seeders" apart from "removed by
+	// the provider" or "download failed".
+	DebridStatus string    `json:"debrid_status,omitempty"`
+	Added        time.Time `json:"added"`
+	Progress     float64   `json:"progress"`
+	Speed        int64     `json:"speed"`
+	Seeders      int       `json:"seeders"`
+	Links        []string  `json:"links"`
+	DeletedFiles []string  `json:"deleted_files"`
 
 	Debrid string `json:"debrid"`
 

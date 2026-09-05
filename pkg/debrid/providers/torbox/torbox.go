@@ -358,6 +358,7 @@ func (tb *Torbox) GetTorrent(torrentId string) (*types.Torrent, error) {
 		Bytes:            data.Size,
 		Progress:         data.Progress * 100,
 		Status:           tb.getTorboxStatus(data.DownloadState, data.DownloadFinished),
+		DebridStatus:     data.DownloadState,
 		Speed:            data.DownloadSpeed,
 		Seeders:          data.Seeds,
 		Filename:         data.Name,
@@ -444,6 +445,7 @@ func (tb *Torbox) UpdateTorrent(t *types.Torrent) error {
 	t.Bytes = data.Size
 	t.Progress = data.Progress * 100
 	t.Status = tb.getTorboxStatus(data.DownloadState, data.DownloadFinished)
+	t.DebridStatus = data.DownloadState
 	t.Speed = data.DownloadSpeed
 	t.Seeders = data.Seeds
 	t.Filename = name
@@ -509,9 +511,19 @@ func (tb *Torbox) CheckStatus(torrent *types.Torrent) (*types.Torrent, error) {
 			}
 			return torrent, nil
 		default:
-			return torrent, fmt.Errorf("torrent: %s has error", torrent.Name)
+			return torrent, fmt.Errorf("torrent: %s has error (torbox state: %s, seeders: %d, progress: %.0f%%)",
+				torrent.Name, torboxStateOrUnknown(torrent.DebridStatus), torrent.Seeders, torrent.Progress)
 		}
 	}
+}
+
+// torboxStateOrUnknown keeps the error readable when the provider sent no
+// state at all.
+func torboxStateOrUnknown(state string) string {
+	if state == "" {
+		return "unknown"
+	}
+	return state
 }
 
 func (tb *Torbox) DeleteTorrent(torrentId string) error {
@@ -642,6 +654,7 @@ func (tb *Torbox) getTorrents(offset int) ([]*types.Torrent, error) {
 			Bytes:            data.Size,
 			Progress:         data.Progress * 100,
 			Status:           tb.getTorboxStatus(data.DownloadState, data.DownloadFinished),
+			DebridStatus:     data.DownloadState,
 			Speed:            data.DownloadSpeed,
 			Seeders:          data.Seeds,
 			Filename:         data.Name,

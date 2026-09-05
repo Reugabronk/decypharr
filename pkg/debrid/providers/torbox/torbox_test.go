@@ -179,3 +179,27 @@ func TestSubmitMagnetSurfacesAPIError(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckStatusReportsTorboxState keeps a dead torrent from being reported
+// as a bare "has error": the provider's own state is what tells the user
+// whether the swarm is empty or something else went wrong.
+func TestCheckStatusReportsTorboxState(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"data":{"id":17,"name":"Release.mkv","size":100,"progress":0,"download_state":"stalled (no seeds)","seeds":0,"created_at":"2026-01-02T03:04:05Z","hash":"ABC","files":[]}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	tb := testTorbox(server.URL)
+	_, err := tb.CheckStatus(&types.Torrent{Id: "17", Name: "Release.mkv"})
+	if err == nil {
+		t.Fatal("CheckStatus() error = nil, want the error state")
+	}
+	for _, want := range []string{"stalled (no seeds)", "seeders: 0"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("CheckStatus() error = %q, want it to mention %q", err.Error(), want)
+		}
+	}
+}
