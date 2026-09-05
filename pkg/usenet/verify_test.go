@@ -135,3 +135,27 @@ func TestPreStreamChecksExpiresFailureMemo(t *testing.T) {
 		t.Fatal("expired memo still present, want it dropped so a fresh failure re-marks it")
 	}
 }
+
+// TestAvailabilityInconclusive keeps a throttled provider from costing the
+// user a good release: a sweep whose probes mostly failed to complete says
+// nothing about whether the post is complete.
+func TestAvailabilityInconclusive(t *testing.T) {
+	tests := []struct {
+		name  string
+		total int
+		errs  int
+		want  bool
+	}{
+		{"the sweep that started this", 420, 342, true},
+		{"exactly half errored is still a verdict", 420, 210, false},
+		{"clean sweep", 420, 0, false},
+		{"nothing sampled", 0, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := availabilityInconclusive(tt.total, tt.errs); got != tt.want {
+				t.Fatalf("availabilityInconclusive(%d, %d) = %v, want %v", tt.total, tt.errs, got, tt.want)
+			}
+		})
+	}
+}

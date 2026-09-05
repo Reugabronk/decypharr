@@ -667,6 +667,22 @@ func (u *Usenet) checkAvailability(ctx context.Context, fileName string, message
 			// All failures were connection errors, not missing articles.
 			return nil
 		}
+		// A sweep that mostly failed to complete is not evidence about the
+		// post. Providers throttle long STAT bursts by dropping connections,
+		// and the not-found answers that come back while the server is
+		// shedding load are not trustworthy either — condemning the release on
+		// them costs the user a good grab. Treat a mostly-errored sweep the
+		// same as the transport error above: couldn't check.
+		if availabilityInconclusive(result.TotalCount, result.ErrorCount) {
+			u.logger.Warn().
+				Str("file", fileName).
+				Int("sampled_segments", len(messageIDs)).
+				Int("available_segments", result.FoundCount).
+				Int("missing_segments", notFoundCount).
+				Int("error_count", result.ErrorCount).
+				Msg("Availability check inconclusive: most probes failed to complete, not failing the NZB")
+			return nil
+		}
 		// At least some segments are definitively missing.
 		u.logger.Warn().
 			Str("file", fileName).
@@ -679,6 +695,14 @@ func (u *Usenet) checkAvailability(ctx context.Context, fileName string, message
 	}
 
 	return nil
+}
+
+// availabilityInconclusive reports whether too much of a STAT sweep failed to
+// complete for its verdict to mean anything. Providers throttle long STAT
+// bursts by dropping connections, and the not-found answers returned while a
+// server sheds load are no more trustworthy than the dropped ones.
+func availabilityInconclusive(total, errCount int) bool {
+	return total > 0 && errCount*2 > total
 }
 
 // sampleSegments returns a sample of segment message IDs based on the given
