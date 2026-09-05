@@ -180,15 +180,15 @@ func TestSubmitMagnetSurfacesAPIError(t *testing.T) {
 	}
 }
 
-// TestCheckStatusReportsTorboxState keeps a dead torrent from being reported
-// as a bare "has error": the provider's own state is what tells the user
-// whether the swarm is empty or something else went wrong.
+// TestCheckStatusReportsTorboxState keeps a failed torrent from being reported
+// as a bare "has error": the provider's own state is what tells the user what
+// actually went wrong.
 func TestCheckStatusReportsTorboxState(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"success":true,"data":{"id":17,"name":"Release.mkv","size":100,"progress":0,"download_state":"stalled (no seeds)","seeds":0,"created_at":"2026-01-02T03:04:05Z","hash":"ABC","files":[]}}`)
+		_, _ = fmt.Fprint(w, `{"success":true,"data":{"id":17,"name":"Release.mkv","size":100,"progress":0,"download_state":"missingFiles","seeds":0,"created_at":"2026-01-02T03:04:05Z","hash":"ABC","files":[]}}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -197,9 +197,34 @@ func TestCheckStatusReportsTorboxState(t *testing.T) {
 	if err == nil {
 		t.Fatal("CheckStatus() error = nil, want the error state")
 	}
-	for _, want := range []string{"stalled (no seeds)", "seeders: 0"} {
+	for _, want := range []string{"missingFiles", "seeders: 0"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("CheckStatus() error = %q, want it to mention %q", err.Error(), want)
 		}
+	}
+}
+
+// TestGetTorboxStatusStalled covers the state a nearly-complete torrent sits
+// in while it waits for a seeder: stalled is a wait, not a failure, and
+// calling it an error retired grabs that were at 99%.
+func TestGetTorboxStatusStalled(t *testing.T) {
+	tb := &Torbox{}
+	tests := []struct {
+		state string
+		want  types.TorrentStatus
+	}{
+		{"stalled (no seeds)", types.TorrentStatusDownloading},
+		{"stalledDL", types.TorrentStatusDownloading},
+		{"stalledUP", types.TorrentStatusDownloaded},
+		{"downloading", types.TorrentStatusDownloading},
+		{"cached", types.TorrentStatusDownloaded},
+		{"some_unknown_state", types.TorrentStatusError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.state, func(t *testing.T) {
+			if got := tb.getTorboxStatus(tt.state, false); got != tt.want {
+				t.Fatalf("getTorboxStatus(%q) = %v, want %v", tt.state, got, tt.want)
+			}
+		})
 	}
 }

@@ -314,15 +314,22 @@ func (tb *Torbox) getTorboxStatus(status string, finished bool) types.TorrentSta
 	if finished {
 		return types.TorrentStatusDownloaded
 	}
+	// "stalled"/"stalledDL" mean the torrent is still downloading but has no
+	// peers right now — a wait, not a failure, and one a torrent at 99% can
+	// come back from when a seeder returns. Treating them as errors condemned
+	// those grabs immediately and kept the stalled-removal sweep (which only
+	// drops entries stuck at 0%, see Queue.DeleteStalled) from ever applying
+	// its time budget.
 	downloading := []string{"paused", "downloading",
 		"checkingResumeData", "metaDL", "pausedUP", "queuedUP", "checkingUP",
 		"forcedUP", "allocating", "downloading", "metaDL", "pausedDL",
 		"queuedDL", "checkingDL", "forcedDL", "checkingResumeData", "moving",
-		"incomplete",
+		"incomplete", "stalled", "stalledDL",
 	}
 
+	// stalledUP is qBittorrent's "done downloading, upload idle".
 	downloaded := []string{
-		"completed", "cached", "uploading", "downloaded",
+		"completed", "cached", "uploading", "downloaded", "stalledUP",
 	}
 
 	status = regexp.MustCompile(`\s*\(.*?\)\s*`).ReplaceAllString(status, "")
