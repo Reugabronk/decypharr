@@ -49,6 +49,16 @@ func (a *Account) sliceFileLink(fileLink string) string {
 func (a *Account) GetDownloadLink(id string, file *types.File, fetcher LinkFetcher) (types.DownloadLink, error) {
 	slicedLink := a.sliceFileLink(file.Link)
 	dl, ok := a.links.Load(slicedLink)
+	if ok && dl.Expired() {
+		// The cache has no TTL of its own, so without this an expired link is
+		// handed out until something fails on it: the read errors out first and
+		// only then does the streaming layer refetch. Providers that hand back
+		// short-lived signed CDN URLs (TorBox) would otherwise break playback
+		// on every file that sat in the cache past its expiry. Drop it and pay
+		// for one fetch instead.
+		a.links.Delete(slicedLink)
+		ok = false
+	}
 	if !ok {
 		var err error
 		dl, err = fetcher(a, id, file)

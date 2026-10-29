@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"go.uber.org/ratelimit"
+	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
 
@@ -38,8 +39,10 @@ type Client struct {
 	timeout         time.Duration
 	skipTLSVerify   bool
 	retryableStatus map[int]struct{}
-	logger          zerolog.Logger
-	proxy           string
+	// responseHeaderTimeout overrides the transport default; 0 keeps it.
+	responseHeaderTimeout time.Duration
+	logger                zerolog.Logger
+	proxy                 string
 }
 
 // WithMaxRetries sets the maximum number of retry attempts
@@ -97,6 +100,18 @@ func WithRetryableStatus(statusCodes ...int) ClientOption {
 		for _, code := range statusCodes {
 			c.retryableStatus[code] = struct{}{}
 		}
+	}
+}
+
+// WithResponseHeaderTimeout overrides how long the transport waits for a
+// server to start answering. The 30s default suits ordinary API calls but not
+// endpoints that do real work before replying — adding an uncached torrent
+// makes the provider contact the swarm first, which routinely takes longer —
+// where the timeout turns a slow success into a failure and the retries into
+// duplicate submissions.
+func WithResponseHeaderTimeout(timeout time.Duration) ClientOption {
+	return func(c *Client) {
+		c.responseHeaderTimeout = timeout
 	}
 }
 
@@ -236,6 +251,10 @@ func New(options ...ClientOption) *Client {
 
 	// Check if transport was set by WithTransport option
 	if client.httpClient.Transport == nil {
+		responseHeaderTimeout := client.responseHeaderTimeout
+		if responseHeaderTimeout <= 0 {
+			responseHeaderTimeout = 30 * time.Second
+		}
 		transport := &http.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: client.skipTLSVerify,
@@ -247,13 +266,24 @@ func New(options ...ClientOption) *Client {
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       30 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
+			ResponseHeaderTimeout: responseHeaderTimeout,
 			ExpectContinueTimeout: 1 * time.Second,
 			ForceAttemptHTTP2:     true,
 		}
 
 		// Configure proxy if needed
 		SetProxy(transport, client.proxy)
+
+		// Teach the HTTP/2 transport to notice dead connections. Without a
+		// health check it keeps a silently-broken connection in the pool — a
+		// routine outcome behind CDNs and NAT — and every request handed that
+		// connection fails instantly with "timeout awaiting response headers",
+		// retries included, since the retries reuse the same dead connection.
+		// With a ping the transport evicts it and dials a fresh one.
+		if h2, err := http2.ConfigureTransports(transport); err == nil && h2 != nil {
+			h2.ReadIdleTimeout = 30 * time.Second
+			h2.PingTimeout = 10 * time.Second
+		}
 
 		// Set the transport to the client
 		client.httpClient.Transport = transport

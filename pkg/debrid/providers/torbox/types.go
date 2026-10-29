@@ -20,6 +20,10 @@ type AddMagnetResponse APIResponse[struct {
 	Hash string `json:"hash"`
 }]
 
+// RequestDLResponse is /api/torrents/requestdl without the redirect parameter:
+// the CDN URL comes back in the body instead of as a 302.
+type RequestDLResponse APIResponse[string]
+
 type torboxInfo struct {
 	Id              int       `json:"id"`
 	AuthId          string    `json:"auth_id"`

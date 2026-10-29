@@ -161,11 +161,23 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 			} else if linkErr.ShouldRefetch() || linkErr.ShouldRetry() {
 				// Invalidate and refetch
 				return s.invalidateAndRefetch(ctx, entry, link, attempt)
+			} else if !linkErr.IsPermanent() {
+				// Anything transient that isn't handled by one of the branches
+				// above (e.g. a throttled/backoff error) must not fall through
+				// to the cache below: only a genuinely permanent failure should
+				// ever be memoized in s.validated. Caching a transient error
+				// here would poison every future GetLink call for this link
+				// until process restart — the download layer above already
+				// retries with its own backoff.
+				return emptyDownloadLink, validationErr
 			}
 		}
 	}
 
-	// Store validation result
+	// Store validation result. Only reached for success or a genuinely
+	// permanent failure (see the transient-error early return above) — never
+	// for a throttled/refetchable/retryable classification, which would
+	// otherwise poison this link for every future GetLink call.
 	// Keys are full download URLs and links rotate on refresh/expiry, so cap
 	// the map; resetting merely costs a re-validation per link.
 	if s.validated.Size() > maxValidatedEntries {

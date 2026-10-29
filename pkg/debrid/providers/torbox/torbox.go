@@ -30,6 +30,13 @@ import (
 	"go.uber.org/ratelimit"
 )
 
+// cdnLinkTTL bounds how long a resolved CDN URL stays in the account link
+// cache. TorBox signs those URLs and retires them after a few hours, well
+// inside the 48h default of auto_expire_links_after, so the cache has to use
+// the shorter of the two or it will serve dead URLs. One refetch per file per
+// hour is nothing against the 300 req/min API budget.
+const cdnLinkTTL = time.Hour
+
 var planSlots = map[string]int{
 	"essential": 3,
 	"standard":  5,
@@ -76,6 +83,15 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		request.WithMaxRetries(cfg.Retries),
 		request.WithRetryableStatus(http.StatusTooManyRequests, http.StatusBadGateway),
 		request.WithLogger(_log),
+		// Adding an uncached torrent makes TorBox go find the swarm before it
+		// answers, which regularly outlasts the 30s default. Giving up there
+		// reports a failure for a submission that often succeeds anyway, and
+		// each retry files the same torrent again.
+		request.WithResponseHeaderTimeout(2 * time.Minute),
+		// The client's overall deadline has to clear that header timeout, or it
+		// cuts the request off first and the longer header timeout never
+		// applies.
+		request.WithTimeout(3 * time.Minute),
 	}
 	if dc.Proxy != "" {
 		opts = append(opts, request.WithProxy(dc.Proxy))
@@ -132,9 +148,14 @@ func (tb *Torbox) doGet(endpoint string, queryParams map[string]string, result a
 	}
 	defer request.DrainAndClose(resp.Body)
 
-	if result != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.ContentLength != 0 {
+	if result != nil && resp.ContentLength != 0 {
 		if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(result); err != nil {
-			return resp, err
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return resp, err
+			}
+			// A failure response that isn't JSON (a proxy's HTML error page,
+			// say) carries no provider message to surface; leave result empty
+			// and let the caller report the status on its own.
 		}
 	}
 
@@ -160,9 +181,14 @@ func (tb *Torbox) doPostForm(endpoint string, formData map[string]string, result
 	}
 	defer request.DrainAndClose(resp.Body)
 
-	if result != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.ContentLength != 0 {
+	if result != nil && resp.ContentLength != 0 {
 		if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(result); err != nil {
-			return resp, err
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return resp, err
+			}
+			// A failure response that isn't JSON (a proxy's HTML error page,
+			// say) carries no provider message to surface; leave result empty
+			// and let the caller report the status on its own.
 		}
 	}
 
@@ -232,6 +258,25 @@ func (tb *Torbox) IsAvailable(hashes []string) map[string]bool {
 	return result
 }
 
+// apiErrorDetail renders TorBox's own error fields as a parenthesised suffix,
+// or an empty string when the API said nothing useful. Error is typed any
+// because TorBox sends either a string code or false.
+func apiErrorDetail(apiErr any, detail string) string {
+	parts := make([]string, 0, 2)
+	if apiErr != nil {
+		if s := strings.TrimSpace(fmt.Sprintf("%v", apiErr)); s != "" && s != "false" && s != "<nil>" {
+			parts = append(parts, s)
+		}
+	}
+	if d := strings.TrimSpace(detail); d != "" {
+		parts = append(parts, d)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ": ") + ")"
+}
+
 func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	var data AddMagnetResponse
 
@@ -248,7 +293,10 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("torbox API error: Status: %d", resp.StatusCode)
+		// Surface TorBox's own explanation: the common failure here is a 400
+		// for an uncached release when add_only_if_cached is set, and a bare
+		// status code sends the user hunting through decypharr instead.
+		return nil, fmt.Errorf("torbox API error: Status: %d%s", resp.StatusCode, apiErrorDetail(data.Error, data.Detail))
 	}
 	if data.Data == nil {
 		return nil, fmt.Errorf("error adding torrent")
@@ -266,15 +314,22 @@ func (tb *Torbox) getTorboxStatus(status string, finished bool) types.TorrentSta
 	if finished {
 		return types.TorrentStatusDownloaded
 	}
+	// "stalled"/"stalledDL" mean the torrent is still downloading but has no
+	// peers right now — a wait, not a failure, and one a torrent at 99% can
+	// come back from when a seeder returns. Treating them as errors condemned
+	// those grabs immediately and kept the stalled-removal sweep (which only
+	// drops entries stuck at 0%, see Queue.DeleteStalled) from ever applying
+	// its time budget.
 	downloading := []string{"paused", "downloading",
 		"checkingResumeData", "metaDL", "pausedUP", "queuedUP", "checkingUP",
 		"forcedUP", "allocating", "downloading", "metaDL", "pausedDL",
 		"queuedDL", "checkingDL", "forcedDL", "checkingResumeData", "moving",
-		"incomplete",
+		"incomplete", "stalled", "stalledDL",
 	}
 
+	// stalledUP is qBittorrent's "done downloading, upload idle".
 	downloaded := []string{
-		"completed", "cached", "uploading", "downloaded",
+		"completed", "cached", "uploading", "downloaded", "stalledUP",
 	}
 
 	status = regexp.MustCompile(`\s*\(.*?\)\s*`).ReplaceAllString(status, "")
@@ -310,6 +365,7 @@ func (tb *Torbox) GetTorrent(torrentId string) (*types.Torrent, error) {
 		Bytes:            data.Size,
 		Progress:         data.Progress * 100,
 		Status:           tb.getTorboxStatus(data.DownloadState, data.DownloadFinished),
+		DebridStatus:     data.DownloadState,
 		Speed:            data.DownloadSpeed,
 		Seeders:          data.Seeds,
 		Filename:         data.Name,
@@ -396,6 +452,7 @@ func (tb *Torbox) UpdateTorrent(t *types.Torrent) error {
 	t.Bytes = data.Size
 	t.Progress = data.Progress * 100
 	t.Status = tb.getTorboxStatus(data.DownloadState, data.DownloadFinished)
+	t.DebridStatus = data.DownloadState
 	t.Speed = data.DownloadSpeed
 	t.Seeders = data.Seeds
 	t.Filename = name
@@ -461,9 +518,33 @@ func (tb *Torbox) CheckStatus(torrent *types.Torrent) (*types.Torrent, error) {
 			}
 			return torrent, nil
 		default:
-			return torrent, fmt.Errorf("torrent: %s has error", torrent.Name)
+			return torrent, fmt.Errorf("torrent: %s has error (torbox state: %s, seeders: %d, progress: %.0f%%)",
+				torrent.Name, torboxStateOrUnknown(torrent.DebridStatus), torrent.Seeders, torrent.Progress)
 		}
 	}
+}
+
+// tokenQueryParam matches the account token TorBox takes as a query parameter.
+// Transport errors quote the whole URL, so logging one verbatim writes the
+// user's API key into a file they are likely to share when asking for help.
+var tokenQueryParam = regexp.MustCompile(`(?i)(token=)[^&\s"]+`)
+
+// redactToken renders an error for the log with any token query parameter
+// masked. A nil error becomes the empty string.
+func redactToken(err error) string {
+	if err == nil {
+		return ""
+	}
+	return tokenQueryParam.ReplaceAllString(err.Error(), "${1}REDACTED")
+}
+
+// torboxStateOrUnknown keeps the error readable when the provider sent no
+// state at all.
+func torboxStateOrUnknown(state string) string {
+	if state == "" {
+		return "unknown"
+	}
+	return state
 }
 
 func (tb *Torbox) DeleteTorrent(torrentId string) error {
@@ -487,28 +568,63 @@ func (tb *Torbox) GetDownloadLink(id string, file *types.File) (types.DownloadLi
 }
 
 func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
-	query := url.Values{}
-	query.Set("token", account.Token)
-	query.Set("torrent_id", id)
-	query.Set("file_id", file.Id)
-	query.Set("redirect", "true")
-
-	downloadURL := fmt.Sprintf("%s/api/torrents/requestdl?%s", tb.Host, query.Encode())
+	params := map[string]string{
+		"token":      account.Token,
+		"torrent_id": id,
+		"file_id":    file.Id,
+	}
 
 	now := time.Now()
 
 	// Always expires
 	dl := types.DownloadLink{
-		Filename:     file.Name,
-		Size:         file.Size,
-		Token:        tb.APIKey,
-		Link:         file.Link,
-		DownloadLink: downloadURL,
-		Debrid:       tb.config.Name,
-		Id:           file.Id,
-		Generated:    now,
-		ExpiresAt:    now.Add(tb.autoExpiresLinksAfter),
+		Filename:  file.Name,
+		Size:      file.Size,
+		Token:     tb.APIKey,
+		Link:      file.Link,
+		Debrid:    tb.config.Name,
+		Id:        file.Id,
+		Generated: now,
+		ExpiresAt: now.Add(tb.autoExpiresLinksAfter),
 	}
+
+	// Resolve the CDN URL here, once, rather than handing the caller TorBox's
+	// requestdl endpoint. That endpoint counts against the 300 req/min API cap,
+	// and the streaming layer issues a request per range read (plus one per
+	// link validation), so a redirect URL spends the whole minute's budget on a
+	// single file's playback and returns 429s for everything else. The resolved
+	// CDN URL is cached by the account link cache, so this costs one API call
+	// per file instead of one per chunk.
+	var res RequestDLResponse
+	resp, err := tb.doGet("/api/torrents/requestdl", params, &res)
+	if err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 &&
+		res.Data != nil && *res.Data != "" {
+		dl.DownloadLink = *res.Data
+		dl.ExpiresAt = now.Add(min(tb.autoExpiresLinksAfter, cdnLinkTTL))
+		return dl, nil
+	}
+
+	// The API gave us no usable URL (transient failure, or a response shape we
+	// don't recognise). Fall back to the redirecting endpoint: rate-limited
+	// playback still beats no playback, and this is what every link looked like
+	// before the resolution step existed.
+	query := url.Values{}
+	for k, v := range params {
+		query.Set(k, v)
+	}
+	query.Set("redirect", "true")
+	dl.DownloadLink = fmt.Sprintf("%s/api/torrents/requestdl?%s", tb.Host, query.Encode())
+
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	tb.logger.Debug().
+		Str("error", redactToken(err)).
+		Int("status", status).
+		Str("file", file.Name).
+		Msg("requestdl returned no direct link, falling back to the redirect URL")
+
 	return dl, nil
 }
 
@@ -559,6 +675,7 @@ func (tb *Torbox) getTorrents(offset int) ([]*types.Torrent, error) {
 			Bytes:            data.Size,
 			Progress:         data.Progress * 100,
 			Status:           tb.getTorboxStatus(data.DownloadState, data.DownloadFinished),
+			DebridStatus:     data.DownloadState,
 			Speed:            data.DownloadSpeed,
 			Seeders:          data.Seeds,
 			Filename:         data.Name,
