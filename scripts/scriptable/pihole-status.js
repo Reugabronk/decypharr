@@ -58,9 +58,11 @@ async function rawRequest(method, path, body, sess) {
   const req = new Request(BASE + path);
   req.method = method;
   req.timeoutInterval = CONFIG.timeoutSeconds;
-  req.headers = { "Content-Type": "application/json" };
-  if (sess && sess.sid) req.headers["X-FTL-SID"] = sess.sid;
-  if (sess && sess.csrf) req.headers["X-FTL-CSRF"] = sess.csrf;
+  // Let op: in Scriptable is req.headers een kopie; altijd het hele object in één keer toewijzen.
+  const h = { "Content-Type": "application/json" };
+  if (sess && sess.sid) h["X-FTL-SID"] = sess.sid;
+  if (sess && sess.csrf) h["X-FTL-CSRF"] = sess.csrf;
+  req.headers = h;
   if (body) req.body = JSON.stringify(body);
   let json = null;
   try {
