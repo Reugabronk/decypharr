@@ -1,5 +1,9 @@
 // Scriptable widget: status van Radarr, Sonarr en Decypharr.
-// Werkt als small, medium en large widget. Tik op de widget om de details te openen.
+// Toont per service de eerste 3 items uit de wachtrij met % en resterende tijd.
+//   small:  status + aantal in queue + de eerstvolgende download
+//   medium: de eerste 3 over Radarr/Sonarr/Decypharr samen (eerst klaar bovenaan)
+//   large:  per service de eerste 3
+// Tik op de widget om de details te openen.
 //
 // Installatie:
 //   1. Installeer Scriptable uit de App Store.
@@ -23,6 +27,7 @@ const CONFIG = {
     url: "http://192.168.1.10:8282",
     apiToken: "", // leeg laten als auth uit staat
   },
+  queueItems: 3, // hoeveel items uit de wachtrij tonen
   timeoutSeconds: 8,
   refreshMinutes: 15,
 };
@@ -55,29 +60,77 @@ function trimUrl(u) {
   return u.replace(/\/+$/, "");
 }
 
-async function arrStatus(name, cfg, missingPath) {
+// "00:12:34" of "1.02:03:04" (Radarr/Sonarr) -> seconden
+function parseTimeleft(t) {
+  if (!t) return null;
+  const m = String(t).match(/^(?:(\d+)\.)?(\d+):(\d+):(\d+)/);
+  if (!m) return null;
+  return (+(m[1] || 0)) * 86400 + (+m[2]) * 3600 + (+m[3]) * 60 + (+m[4]);
+}
+
+function fmtDuration(sec) {
+  if (sec == null || !isFinite(sec) || sec < 0) return "?";
+  if (sec < 60) return "<1m";
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d) return `${d}d ${h}u`;
+  if (h) return `${h}u ${m}m`;
+  return `${m}m`;
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function arrItemTitle(item) {
+  if (item.series && item.episode) {
+    const e = item.episode;
+    return `${item.series.title} S${pad2(e.seasonNumber)}E${pad2(e.episodeNumber)}`;
+  }
+  if (item.movie) return item.movie.title + (item.movie.year ? ` (${item.movie.year})` : "");
+  return item.title || "?";
+}
+
+function arrItemState(item) {
+  const st = (item.trackedDownloadState || item.status || "").toLowerCase();
+  if (item.trackedDownloadStatus === "warning" || item.trackedDownloadStatus === "error") return "warn";
+  if (st === "importpending" || st === "importing") return "import";
+  if (st === "queued" || st === "delay" || st === "paused") return "wacht";
+  return "";
+}
+
+async function arrStatus(name, cfg, extra) {
   const base = trimUrl(cfg.url) + "/api/v3";
   const h = { "X-Api-Key": cfg.apiKey };
   try {
     const [status, health, queue, missing] = await Promise.all([
       getJSON(`${base}/system/status`, h),
       getJSON(`${base}/health`, h),
-      getJSON(`${base}/queue?pageSize=1`, h),
-      getJSON(`${base}/${missingPath}?pageSize=1&monitored=true`, h),
+      getJSON(`${base}/queue?page=1&pageSize=${CONFIG.queueItems}&sortKey=timeleft&sortDirection=ascending&${extra}`, h),
+      getJSON(`${base}/wanted/missing?pageSize=1&monitored=true`, h),
     ]);
     const issues = (health || []).filter((x) => x.type !== "notice");
     const errors = issues.filter((x) => x.type === "error");
+    const items = (queue.records || []).map((r) => {
+      const size = r.size || 0;
+      const left = r.sizeleft || 0;
+      return {
+        title: arrItemTitle(r),
+        pct: size > 0 ? Math.max(0, Math.min(100, ((size - left) / size) * 100)) : 0,
+        eta: parseTimeleft(r.timeleft),
+        state: arrItemState(r),
+      };
+    });
     return {
       name,
       url: cfg.url,
       online: true,
       level: errors.length ? "err" : issues.length ? "warn" : "ok",
       version: status.version,
-      lines: [
-        `Queue: ${queue.totalRecords ?? 0}`,
-        `Missing: ${missing.totalRecords ?? 0}`,
-        issues.length ? `Health: ${issues.length} issue(s)` : "Health: OK",
-      ],
+      queueTotal: queue.totalRecords ?? items.length,
+      summary: `${queue.totalRecords ?? 0} in queue · ${missing.totalRecords ?? 0} missing`,
+      items,
       details: issues.map((x) => `[${x.type}] ${x.message}`),
     };
   } catch (e) {
@@ -89,7 +142,10 @@ async function decypharrStatus(cfg) {
   const base = trimUrl(cfg.url);
   const h = cfg.apiToken ? { Authorization: `Bearer ${cfg.apiToken}` } : {};
   try {
-    const s = await getJSON(`${base}/debug/stats`, h);
+    const [s, q] = await Promise.all([
+      getJSON(`${base}/debug/stats`, h),
+      getJSON(`${base}/api/torrents?state=downloading&limit=${CONFIG.queueItems}&sort_by=progress&sort_order=desc`, h),
+    ]);
     const details = [];
     let level = "ok";
 
@@ -98,18 +154,13 @@ async function decypharrStatus(cfg) {
       level = "err";
       details.push(`Mount niet ready${mount.error ? ": " + mount.error : ""}`);
     }
-
-    const health = (s.repair && s.repair.health) || {};
-    const broken = health.broken || 0;
+    const broken = ((s.repair && s.repair.health) || {}).broken || 0;
     if (broken > 0) {
       if (level === "ok") level = "warn";
       details.push(`${broken} kapotte item(s) in repair`);
     }
-
-    let bad = 0;
     const now = Date.now();
     for (const d of s.debrids || []) {
-      bad += (d.library && d.library.bad) || 0;
       const p = d.profile;
       if (p && p.expiration) {
         const days = Math.floor((new Date(p.expiration).getTime() - now) / 86400000);
@@ -120,18 +171,29 @@ async function decypharrStatus(cfg) {
       }
     }
 
-    const q = s.queue || {};
+    // progress is 0..1 in Decypharr
+    const items = (q.torrents || []).map((t) => {
+      const frac = Math.max(0, Math.min(1, t.progress || 0));
+      const size = t.bytes || t.size || 0;
+      const speed = t.speed || 0;
+      return {
+        title: t.name || "?",
+        pct: frac * 100,
+        eta: speed > 0 && size > 0 ? (size * (1 - frac)) / speed : null,
+        state: "",
+      };
+    });
+
+    const qs = s.queue || {};
     return {
       name: "Decypharr",
       url: cfg.url,
       online: true,
       level,
       version: s.system && s.system.uptime ? `up ${s.system.uptime}` : "",
-      lines: [
-        `Queue: ${q.active ?? 0} actief / ${q.pending ?? 0} wacht`,
-        `Streams: ${(s.active_streams && s.active_streams.count) || 0}`,
-        broken || bad ? `Broken: ${broken} · Bad: ${bad}` : "Library: OK",
-      ],
+      queueTotal: q.total ?? items.length,
+      summary: `${qs.active ?? 0} actief · ${qs.pending ?? 0} wacht · ${(s.active_streams && s.active_streams.count) || 0} streams`,
+      items,
       details,
     };
   } catch (e) {
@@ -146,7 +208,9 @@ function offline(name, url, e) {
     online: false,
     level: "err",
     version: "",
-    lines: ["Offline"],
+    queueTotal: 0,
+    summary: "Offline",
+    items: [],
     details: [String(e.message || e)],
   };
 }
@@ -155,71 +219,147 @@ function levelColor(l) {
   return l === "ok" ? COLORS.ok : l === "warn" ? COLORS.warn : COLORS.err;
 }
 
-function addService(stack, svc, compact) {
-  const row = stack.addStack();
-  row.layoutVertically();
+function progressBar(pct, color, width) {
+  const h = 4;
+  const ctx = new DrawContext();
+  ctx.size = new Size(width, h);
+  ctx.opaque = false;
+  ctx.respectScreenScale = true;
+  const track = new Path();
+  track.addRoundedRect(new Rect(0, 0, width, h), 2, 2);
+  ctx.addPath(track);
+  ctx.setFillColor(new Color("#888888", 0.25));
+  ctx.fillPath();
+  const w = Math.max(h, (width * Math.min(100, pct)) / 100);
+  const bar = new Path();
+  bar.addRoundedRect(new Rect(0, 0, w, h), 2, 2);
+  ctx.addPath(bar);
+  ctx.setFillColor(color);
+  ctx.fillPath();
+  return ctx.getImage();
+}
 
-  const head = row.addStack();
+function itemRight(it) {
+  const pct = `${Math.floor(it.pct)}%`;
+  if (it.state === "import") return `${pct} · import`;
+  if (it.state === "wacht") return `${pct} · wacht`;
+  return `${pct} · ${fmtDuration(it.eta)}`;
+}
+
+function addItem(stack, it, barWidth, prefix) {
+  const row = stack.addStack();
+  row.centerAlignContent();
+  const t = row.addText((prefix ? prefix + " " : "") + it.title);
+  t.font = Font.systemFont(11);
+  t.textColor = COLORS.text;
+  t.lineLimit = 1;
+  row.addSpacer(6);
+  const r = row.addText(itemRight(it));
+  r.font = Font.semiboldMonospacedSystemFont(10);
+  r.textColor = it.state === "warn" ? COLORS.warn : COLORS.sub;
+  stack.addSpacer(2);
+  const img = stack.addImage(progressBar(it.pct, it.state === "warn" ? COLORS.warn : COLORS.ok, barWidth));
+  img.imageSize = new Size(barWidth, 4);
+  stack.addSpacer(4);
+}
+
+function addHeader(stack, svc, showSummary) {
+  const head = stack.addStack();
   head.centerAlignContent();
   const dot = head.addText("●");
-  dot.font = Font.systemFont(compact ? 10 : 12);
+  dot.font = Font.systemFont(11);
   dot.textColor = levelColor(svc.level);
   head.addSpacer(4);
   const t = head.addText(svc.name);
-  t.font = Font.boldSystemFont(compact ? 12 : 14);
+  t.font = Font.boldSystemFont(13);
   t.textColor = COLORS.text;
-  if (!compact && svc.version) {
-    head.addSpacer(6);
-    const v = head.addText(svc.version);
+  if (showSummary) {
+    head.addSpacer();
+    const v = head.addText(svc.summary);
     v.font = Font.systemFont(10);
-    v.textColor = COLORS.sub;
+    v.textColor = svc.online ? COLORS.sub : COLORS.err;
     v.lineLimit = 1;
   }
-
-  const lines = compact ? [svc.online ? svc.lines[0] : "Offline"] : svc.lines;
-  for (const l of lines) {
-    const x = row.addText(l);
-    x.font = Font.systemFont(compact ? 10 : 11);
-    x.textColor = COLORS.sub;
-    x.lineLimit = 1;
-  }
+  stack.addSpacer(3);
 }
 
 function buildWidget(services) {
   const w = new ListWidget();
   w.backgroundColor = COLORS.bg;
-  w.setPadding(12, 12, 12, 12);
+  w.setPadding(12, 14, 10, 14);
   w.refreshAfterDate = new Date(Date.now() + CONFIG.refreshMinutes * 60000);
 
   const family = config.widgetFamily || "large";
+  const barWidth = family === "small" ? 130 : 300;
 
   if (family === "small") {
+    // alleen status + aantal in de queue per service
     for (const s of services) {
-      addService(w, s, true);
+      const row = w.addStack();
+      row.centerAlignContent();
+      const dot = row.addText("●");
+      dot.font = Font.systemFont(10);
+      dot.textColor = levelColor(s.level);
+      row.addSpacer(4);
+      const t = row.addText(s.name);
+      t.font = Font.boldSystemFont(12);
+      t.textColor = COLORS.text;
+      row.addSpacer();
+      const c = row.addText(s.online ? String(s.queueTotal) : "off");
+      c.font = Font.semiboldMonospacedSystemFont(12);
+      c.textColor = s.online ? COLORS.sub : COLORS.err;
       w.addSpacer(6);
     }
+    // eerstvolgende download eronder
+    const next = services.flatMap((s) => s.items).filter((i) => !i.state).sort((a, b) => (a.eta ?? 1e12) - (b.eta ?? 1e12))[0];
+    if (next) {
+      w.addSpacer(2);
+      addItem(w, next, barWidth);
+    }
   } else if (family === "medium") {
-    const row = w.addStack();
-    row.topAlignContent();
+    // statusregel + de eerste N over alle services samen
+    const head = w.addStack();
+    head.centerAlignContent();
     services.forEach((s, i) => {
-      const col = row.addStack();
-      col.layoutVertically();
-      addService(col, s, false);
-      if (i < services.length - 1) row.addSpacer();
+      const dot = head.addText("●");
+      dot.font = Font.systemFont(10);
+      dot.textColor = levelColor(s.level);
+      head.addSpacer(3);
+      const t = head.addText(`${s.name} ${s.online ? s.queueTotal : "off"}`);
+      t.font = Font.boldSystemFont(11);
+      t.textColor = COLORS.text;
+      if (i < services.length - 1) head.addSpacer(10);
     });
+    w.addSpacer(6);
+    const tag = { Radarr: "🎬", Sonarr: "📺", Decypharr: "⬇️" };
+    const all = services
+      .flatMap((s) => s.items.map((it) => ({ ...it, prefix: tag[s.name] || "" })))
+      .sort((a, b) => (a.eta ?? 1e12) - (b.eta ?? 1e12))
+      .slice(0, CONFIG.queueItems);
+    if (!all.length) {
+      const x = w.addText("Niets in de wachtrij");
+      x.font = Font.systemFont(11);
+      x.textColor = COLORS.sub;
+    }
+    for (const it of all) addItem(w, it, barWidth, it.prefix);
     w.addSpacer();
   } else {
+    // large: per service de eerste N
     for (const s of services) {
-      addService(w, s, false);
-      if (s.details.length) {
-        for (const d of s.details.slice(0, 2)) {
-          const x = w.addText("• " + d);
-          x.font = Font.systemFont(10);
-          x.textColor = levelColor(s.level);
-          x.lineLimit = 1;
-        }
+      addHeader(w, s, true);
+      if (!s.online) {
+        const x = w.addText(s.details[0] || "Offline");
+        x.font = Font.systemFont(10);
+        x.textColor = COLORS.err;
+        x.lineLimit = 1;
+      } else if (!s.items.length) {
+        const x = w.addText(s.details[0] ? "• " + s.details[0] : "Niets in de wachtrij");
+        x.font = Font.systemFont(10);
+        x.textColor = s.details[0] ? levelColor(s.level) : COLORS.sub;
+        x.lineLimit = 1;
       }
-      w.addSpacer(8);
+      for (const it of s.items) addItem(w, it, barWidth);
+      w.addSpacer(6);
     }
     w.addSpacer();
   }
@@ -242,7 +382,7 @@ async function showTable(services) {
     h.addText(`${s.level === "ok" ? "🟢" : s.level === "warn" ? "🟠" : "🔴"} ${s.name}`, s.version);
     h.onSelect = () => Safari.open(s.url);
     table.addRow(h);
-    for (const l of [...s.lines, ...s.details]) {
+    for (const l of [s.summary, ...s.items.map((it) => `${it.title} — ${itemRight(it)}`), ...s.details]) {
       const r = new UITableRow();
       r.addText(l);
       table.addRow(r);
@@ -252,8 +392,8 @@ async function showTable(services) {
 }
 
 const services = await Promise.all([
-  arrStatus("Radarr", CONFIG.radarr, "wanted/missing"),
-  arrStatus("Sonarr", CONFIG.sonarr, "wanted/missing"),
+  arrStatus("Radarr", CONFIG.radarr, "includeMovie=true"),
+  arrStatus("Sonarr", CONFIG.sonarr, "includeSeries=true&includeEpisode=true"),
   decypharrStatus(CONFIG.decypharr),
 ]);
 
