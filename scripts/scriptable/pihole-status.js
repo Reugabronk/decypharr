@@ -3,13 +3,16 @@
 //   medium: cijfers + grafiek van de laatste 24 uur
 //   large:  cijfers + grafiek + top 3 geblokkeerde domeinen + top 3 clients
 //
-// In de app (of via tik op de widget): menu om blocking te pauzeren / aan te zetten.
+// In de app (of via tik op de widget): menu om blocking te pauzeren / aan te zetten,
+// en "Diagnose" om te zien wat Pi-hole precies antwoordt (wordt naar het klembord gekopieerd).
 // Via Shortcuts/Siri: geef als parameter "pause5", "pause30", "pause60", "enable" of "status".
 //
 // Wachtwoord: gebruik bij voorkeur een app password
 //   (Pi-hole > Settings > Web interface / API > Expert-modus > "Configure app password").
 //   Dat werkt ook als je 2FA aan hebt. Leeg laten als je Pi-hole geen wachtwoord heeft.
 // Gebruik http:// — https met het self-signed certificaat van Pi-hole weigert iOS.
+
+const SCRIPT_VERSION = "v5";
 
 const CONFIG = {
   name: "Pi-hole",
@@ -84,7 +87,7 @@ async function login() {
     }
     const msg = (r.json && r.json.error && (r.json.error.message + (r.json.error.hint ? " – " + r.json.error.hint : ""))) || (s && s.message) || "onbekend";
     const hint = s && s.totp ? " (2FA staat aan: gebruik een app password)" : "";
-    throw new Error(`Login mislukt (HTTP ${r.code}): ${msg}${hint}`);
+    throw new Error(`Login mislukt (HTTP ${r.code}): ${msg}${hint} [${SCRIPT_VERSION}]`);
   }
   // sid is null als er geen wachtwoord nodig is
   const sess = s.sid ? { sid: s.sid, csrf: s.csrf || null } : null;
@@ -108,19 +111,19 @@ async function api(method, path, body) {
   }
   if (r.code >= 400 || !r.json) {
     const msg = (r.json && r.json.error && r.json.error.message) || "";
-    throw new Error(`HTTP ${r.code}${msg ? ": " + msg : ""} (${path})`);
+    throw new Error(`HTTP ${r.code}${msg ? ": " + msg : ""} (${path}) [${SCRIPT_VERSION}]`);
   }
   return r.json;
 }
 
 async function loadData() {
-  const [summary, blocking, history, topBlocked, topClients] = await Promise.all([
-    api("GET", "/stats/summary"),
-    api("GET", "/dns/blocking"),
-    api("GET", "/history"),
-    api("GET", "/stats/top_domains?blocked=true&count=3"),
-    api("GET", "/stats/top_clients?count=3"),
-  ]);
+  // Na elkaar i.p.v. tegelijk: voorkomt dat meerdere requests tegelijk een sessie aanmaken.
+  if (!getSession() && CONFIG.password) await sharedLogin();
+  const summary = await api("GET", "/stats/summary");
+  const blocking = await api("GET", "/dns/blocking");
+  const history = await api("GET", "/history");
+  const topBlocked = await api("GET", "/stats/top_domains?blocked=true&count=3");
+  const topClients = await api("GET", "/stats/top_clients?count=3");
   const q = summary.queries || {};
   return {
     online: true,
@@ -325,6 +328,49 @@ async function runAction(action) {
   return null;
 }
 
+
+// Stapsgewijze diagnose: laat precies zien wat Pi-hole antwoordt.
+// Wachtwoord, sid en csrf worden niet getoond, alleen of ze er zijn.
+async function diagnose() {
+  const out = [`Script ${SCRIPT_VERSION}`, `URL: ${BASE}`];
+  const pw = String(CONFIG.password || "");
+  out.push(`Wachtwoord ingevuld: ${pw && pw !== "VUL_IN" ? "ja (" + pw.length + " tekens)" : "NEE"}`);
+  const short = (j) => {
+    const t = JSON.stringify(j);
+    return t ? t.slice(0, 200) : "(geen JSON)";
+  };
+  try {
+    const r1 = await rawRequest("POST", "/auth", { password: pw.trim() });
+    const s1 = (r1.json && r1.json.session) || {};
+    out.push(`\n1. POST /auth -> HTTP ${r1.code}`);
+    out.push(`   valid=${s1.valid} totp=${s1.totp} sid=${s1.sid ? "ja" : "nee"} csrf=${s1.csrf ? "ja" : "nee"} validity=${s1.validity}`);
+    out.push(`   message=${s1.message || (r1.json && r1.json.error && r1.json.error.message) || "-"}`);
+    const sess = s1.sid ? { sid: s1.sid, csrf: s1.csrf } : null;
+    if (sess) setSession(sess);
+
+    const r2 = await rawRequest("GET", "/auth", null, sess);
+    const s2 = (r2.json && r2.json.session) || {};
+    out.push(`\n2. GET /auth (met sid) -> HTTP ${r2.code}  valid=${s2.valid}`);
+
+    const r3 = await rawRequest("GET", "/stats/summary", null, sess);
+    out.push(`\n3. GET /stats/summary (met sid) -> HTTP ${r3.code}`);
+    if (r3.code >= 400) out.push("   " + short(r3.json));
+
+    const r4 = await rawRequest("GET", "/history", null, sess);
+    out.push(`4. GET /history (met sid) -> HTTP ${r4.code}`);
+    if (r4.code >= 400) out.push("   " + short(r4.json));
+
+    const r5 = await rawRequest("GET", "/stats/summary", null, null);
+    out.push(`5. GET /stats/summary (zonder sid) -> HTTP ${r5.code}`);
+
+    const r6 = await rawRequest("GET", "/stats/summary", null, sess ? { sid: sess.sid } : null);
+    out.push(`6. GET /stats/summary (sid, geen csrf) -> HTTP ${r6.code}`);
+  } catch (e) {
+    out.push("\nNetwerkfout: " + (e.message || e));
+  }
+  return out.join("\n");
+}
+
 async function main() {
   let d;
   try {
@@ -373,6 +419,8 @@ async function main() {
   }
   a.addAction("Widget bekijken");
   actions.push("preview");
+  a.addAction("Diagnose");
+  actions.push("diagnose");
   a.addAction("Open Pi-hole");
   actions.push("open");
   a.addCancelAction("Sluiten");
@@ -380,6 +428,16 @@ async function main() {
   if (i < 0) return;
   const act = actions[i];
   if (act === "preview") return buildWidget(d).presentLarge();
+  if (act === "diagnose") {
+    const text = await diagnose();
+    Pasteboard.copy(text);
+    const r = new Alert();
+    r.title = "Diagnose (gekopieerd)";
+    r.message = text;
+    r.addAction("OK");
+    await r.present();
+    return;
+  }
   if (act === "open") return Safari.open(CONFIG.url.replace(/\/+$/, "") + "/admin/");
   try {
     const msg = await runAction(act);
