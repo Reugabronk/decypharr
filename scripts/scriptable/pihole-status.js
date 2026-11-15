@@ -68,11 +68,15 @@ async function rawRequest(method, path, body, sid) {
 // Hergebruikt de sessie uit de Keychain zodat Pi-hole niet bij elke refresh
 // een nieuwe sessie aanmaakt (v6 heeft een max aantal sessies).
 async function login() {
-  const r = await rawRequest("POST", "/auth", { password: CONFIG.password });
+  const r = await rawRequest("POST", "/auth", { password: String(CONFIG.password).trim() });
   const s = r.json && r.json.session;
   if (!s || !s.valid) {
-    const msg = (r.json && r.json.error && r.json.error.message) || (s && s.message) || `HTTP ${r.code}`;
-    throw new Error("Login mislukt: " + msg);
+    if (r.code === 404 || (!r.json && r.code)) {
+      throw new Error(`Login mislukt (HTTP ${r.code}): geen Pi-hole v6 API op ${BASE}/auth. Klopt de URL/poort en draai je Pi-hole v6?`);
+    }
+    const msg = (r.json && r.json.error && (r.json.error.message + (r.json.error.hint ? " – " + r.json.error.hint : ""))) || (s && s.message) || "onbekend";
+    const hint = s && s.totp ? " (2FA staat aan: gebruik een app password)" : "";
+    throw new Error(`Login mislukt (HTTP ${r.code}): ${msg}${hint}`);
   }
   setSid(s.sid || null); // sid is null als er geen wachtwoord nodig is
   return s.sid || null;
