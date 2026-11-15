@@ -35,26 +35,32 @@ const COLORS = {
 const BASE = CONFIG.url.replace(/\/+$/, "") + "/api";
 const SID_KEY = "pihole_sid_" + CONFIG.url;
 
-function getSid() {
+// Sessie = { sid, csrf }. iOS bewaart automatisch het "sid"-cookie dat Pi-hole
+// bij het inloggen zet. Pi-hole geeft een cookie voorrang boven de X-FTL-SID
+// header, en bij een cookie eist hij ook de CSRF-token. Daarom sturen we die altijd mee.
+function getSession() {
   try {
-    return Keychain.contains(SID_KEY) ? Keychain.get(SID_KEY) : null;
+    if (!Keychain.contains(SID_KEY)) return null;
+    const v = JSON.parse(Keychain.get(SID_KEY));
+    return v && v.sid ? v : null;
   } catch (e) {
     return null;
   }
 }
-function setSid(sid) {
+function setSession(sess) {
   try {
-    if (sid) Keychain.set(SID_KEY, sid);
+    if (sess && sess.sid) Keychain.set(SID_KEY, JSON.stringify(sess));
     else if (Keychain.contains(SID_KEY)) Keychain.remove(SID_KEY);
   } catch (e) {}
 }
 
-async function rawRequest(method, path, body, sid) {
+async function rawRequest(method, path, body, sess) {
   const req = new Request(BASE + path);
   req.method = method;
   req.timeoutInterval = CONFIG.timeoutSeconds;
   req.headers = { "Content-Type": "application/json" };
-  if (sid) req.headers["X-FTL-SID"] = sid;
+  if (sess && sess.sid) req.headers["X-FTL-SID"] = sess.sid;
+  if (sess && sess.csrf) req.headers["X-FTL-CSRF"] = sess.csrf;
   if (body) req.body = JSON.stringify(body);
   let json = null;
   try {
@@ -78,26 +84,25 @@ async function login() {
     const hint = s && s.totp ? " (2FA staat aan: gebruik een app password)" : "";
     throw new Error(`Login mislukt (HTTP ${r.code}): ${msg}${hint}`);
   }
-  setSid(s.sid || null); // sid is null als er geen wachtwoord nodig is
-  return s.sid || null;
+  // sid is null als er geen wachtwoord nodig is
+  const sess = s.sid ? { sid: s.sid, csrf: s.csrf || null } : null;
+  setSession(sess);
+  return sess;
 }
 
 // Eén gedeelde login, zodat parallelle requests niet elk een sessie aanmaken.
 let loginPromise = null;
-function sharedLogin(staleSid) {
-  if (!loginPromise || loginPromise.staleSid !== staleSid) {
-    loginPromise = login();
-    loginPromise.staleSid = staleSid;
-  }
+function sharedLogin() {
+  if (!loginPromise) loginPromise = login();
   return loginPromise;
 }
 
 async function api(method, path, body) {
-  let sid = getSid();
-  let r = await rawRequest(method, path, body, sid);
+  let sess = getSession();
+  let r = await rawRequest(method, path, body, sess);
   if (r.code === 401 || r.code === 403) {
-    sid = await sharedLogin(sid);
-    r = await rawRequest(method, path, body, sid);
+    sess = await sharedLogin();
+    r = await rawRequest(method, path, body, sess);
   }
   if (r.code >= 400 || !r.json) {
     const msg = (r.json && r.json.error && r.json.error.message) || "";
